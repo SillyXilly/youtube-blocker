@@ -12,7 +12,7 @@ class ShortsBlockerService : AccessibilityService() {
     private val KEY_BLOCKING_ENABLED = "blocking_enabled"
     private val TAG = "ShortsBlocker"
 
-    private val SHORTS_LABELS = setOf("shorts", "short", "reels")
+    private val SHORTS_LABELS = setOf("shorts", "short", "reels", "reel", "#shorts")
 
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
         event ?: return
@@ -46,14 +46,11 @@ class ShortsBlockerService : AccessibilityService() {
     private fun checkNodeForShorts(node: AccessibilityNodeInfo): Boolean {
         val text = node.text?.toString()?.lowercase() ?: ""
         val desc = node.contentDescription?.toString()?.lowercase() ?: ""
+        val viewId = node.viewIdResourceName?.lowercase() ?: ""
         val labelMatches = SHORTS_LABELS.any { label -> text.contains(label) || desc.contains(label) }
-
-        if (labelMatches) {
-            if (node.isSelected || node.isChecked || node.isFocused) return true
-            val viewId = node.viewIdResourceName?.lowercase() ?: ""
-            if (viewId.contains("reel") || viewId.contains("short")) return true
-        }
-
+        if (labelMatches && (node.isSelected || node.isChecked || node.isFocused)) return true
+        if (viewId.contains("reel") || viewId.contains("short")) return true
+        if (text.contains("#shorts") || desc.contains("#shorts")) return true
         for (i in 0 until node.childCount) {
             val child = node.getChild(i) ?: continue
             if (checkNodeForShorts(child)) {
@@ -62,7 +59,6 @@ class ShortsBlockerService : AccessibilityService() {
             }
             child.recycle()
         }
-
         return false
     }
 
