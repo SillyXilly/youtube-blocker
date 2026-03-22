@@ -297,11 +297,36 @@ class DnsVpnService : VpnService() {
         response[2] = (totalLength shr 8).toByte()
         response[3] = (totalLength and 0xFF).toByte()
 
-        // Clear IP checksum — kernel recalculates
+        // Compute IP header checksum — MUST be correct because packets
+        // written into the TUN device are treated as INCOMING by the kernel,
+        // which VALIDATES (not recalculates) the checksum. A zero/wrong
+        // checksum causes the kernel to silently drop the packet.
         response[10] = 0
         response[11] = 0
+        val checksum = ipChecksum(response, ipHeaderLen)
+        response[10] = (checksum shr 8).toByte()
+        response[11] = (checksum and 0xFF).toByte()
 
         return response
+    }
+
+    /**
+     * Computes the standard IP header checksum (RFC 1071):
+     * 16-bit one's complement of the one's complement sum of all 16-bit words.
+     */
+    private fun ipChecksum(packet: ByteArray, headerLen: Int): Int {
+        var sum = 0L
+        var i = 0
+        while (i < headerLen) {
+            val word = ((packet[i].toInt() and 0xFF) shl 8) or (packet[i + 1].toInt() and 0xFF)
+            sum += word
+            i += 2
+        }
+        // Fold 32-bit sum into 16 bits
+        while (sum shr 16 != 0L) {
+            sum = (sum and 0xFFFF) + (sum shr 16)
+        }
+        return (sum.toInt().inv()) and 0xFFFF
     }
 
     private fun extractDnsQueryDomain(dns: ByteArray): String? {
