@@ -11,6 +11,8 @@ import java.net.DatagramPacket
 import java.net.DatagramSocket
 import java.net.InetAddress
 import java.nio.ByteBuffer
+import java.util.concurrent.ExecutorService
+import java.util.concurrent.Executors
 
 class DnsVpnService : VpnService() {
 
@@ -30,6 +32,7 @@ class DnsVpnService : VpnService() {
 
     private var vpnThread: Thread? = null
     private var pfd: ParcelFileDescriptor? = null
+    private var dnsExecutor: ExecutorService? = null
     @Volatile private var running = false
 
     companion object {
@@ -73,9 +76,20 @@ class DnsVpnService : VpnService() {
 
         val vpnInterface = pfd ?: return
 
+        // Thread pool for concurrent DNS forwarding — prevents one slow
+        // upstream lookup from blocking all other DNS queries.
+        val executor = Executors.newFixedThreadPool(8)
+        dnsExecutor = executor
+
+        // Cache the blocked-domain set so we don't hit SharedPreferences on every packet.
+        // It refreshes every ~50 packets to pick up changes without constant I/O.
+        var cachedBlockedDomains = getBlockedDomains()
+        var packetCount = 0
+
         vpnThread = Thread {
             val inputStream  = FileInputStream(vpnInterface.fileDescriptor)
             val outputStream = FileOutputStream(vpnInterface.fileDescriptor)
+            val outputLock   = Any()          // guards writes — OutputStreams aren't thread-safe
             val buffer = ByteArray(32767)
 
             while (running) {
@@ -84,9 +98,43 @@ class DnsVpnService : VpnService() {
                     if (length <= 0) continue
 
                     val packet = buffer.copyOf(length)
-                    val response = handleDnsPacket(packet)
-                    if (response != null) {
-                        outputStream.write(response)
+
+                    // Refresh blocked domains periodically
+                    packetCount++
+                    if (packetCount % 50 == 0) {
+                        cachedBlockedDomains = getBlockedDomains()
+                    }
+
+                    // Parse the packet on this thread (fast, no I/O)
+                    val parsed = parseDnsPacket(packet) ?: continue
+                    val (ipHeaderLen, dnsPayload, queriedDomain) = parsed
+
+                    val shouldBlock = queriedDomain != null && cachedBlockedDomains.any { blocked ->
+                        queriedDomain == blocked || queriedDomain.endsWith(".$blocked")
+                    }
+
+                    if (shouldBlock) {
+                        // Blocking is instant — no network I/O needed
+                        Log.d(TAG, "Blocking: $queriedDomain")
+                        val response = buildNxdomainResponse(packet, ipHeaderLen, dnsPayload)
+                        synchronized(outputLock) { outputStream.write(response) }
+                    } else {
+                        // Forward on a worker thread so we don't stall the read loop
+                        executor.execute {
+                            try {
+                                val response = forwardToUpstreamDns(packet, ipHeaderLen, dnsPayload)
+                                if (response != null) {
+                                    synchronized(outputLock) { outputStream.write(response) }
+                                } else {
+                                    // Upstream failed — return SERVFAIL so the client retries
+                                    // quickly instead of hanging until its own timeout.
+                                    val servfail = buildServfailResponse(packet, ipHeaderLen, dnsPayload)
+                                    synchronized(outputLock) { outputStream.write(servfail) }
+                                }
+                            } catch (e: Exception) {
+                                if (running) Log.e(TAG, "DNS worker error: ${e.message}")
+                            }
+                        }
                     }
                 } catch (e: Exception) {
                     if (running) Log.e(TAG, "VPN loop error: ${e.message}")
@@ -99,6 +147,8 @@ class DnsVpnService : VpnService() {
 
     private fun stopVpn() {
         running = false
+        dnsExecutor?.shutdownNow()
+        dnsExecutor = null
         vpnThread?.interrupt()
         vpnThread = null
         try { pfd?.close() } catch (e: Exception) { Log.e(TAG, "Error closing VPN: ${e.message}") }
@@ -107,15 +157,14 @@ class DnsVpnService : VpnService() {
         Log.d(TAG, "VPN stopped")
     }
 
+    /** Parsed DNS packet: ipHeaderLen, dnsPayload, queriedDomain (nullable). */
+    private data class ParsedDns(val ipHeaderLen: Int, val dnsPayload: ByteArray, val queriedDomain: String?)
+
     /**
-     * Handles an incoming IPv4/UDP/DNS packet.
-     *
-     * - If the queried domain is in the block list: returns a NXDOMAIN response.
-     * - If the queried domain is NOT blocked: forwards the query to the real upstream
-     *   DNS (8.8.8.8), waits for the real response, and returns it.
-     * - If the packet is not a DNS query: returns null (ignored).
+     * Parses an incoming IPv4/UDP/DNS packet.
+     * Returns null if the packet isn't a valid DNS query.
      */
-    private fun handleDnsPacket(packet: ByteArray): ByteArray? {
+    private fun parseDnsPacket(packet: ByteArray): ParsedDns? {
         return try {
             if (packet.size < 20) return null
 
@@ -136,20 +185,9 @@ class DnsVpnService : VpnService() {
             val queriedDomain = extractDnsQueryDomain(dnsPayload)
             Log.d(TAG, "DNS query: $queriedDomain")
 
-            val blockedDomains = getBlockedDomains()
-            val shouldBlock = queriedDomain != null && blockedDomains.any { blocked ->
-                queriedDomain == blocked || queriedDomain.endsWith(".$blocked")
-            }
-
-            if (shouldBlock) {
-                Log.d(TAG, "Blocking: $queriedDomain")
-                buildNxdomainResponse(packet, ipHeaderLen, dnsPayload)
-            } else {
-                // Forward to real DNS and relay the real answer back
-                forwardToUpstreamDns(packet, ipHeaderLen, dnsPayload)
-            }
+            ParsedDns(ipHeaderLen, dnsPayload, queriedDomain)
         } catch (e: Exception) {
-            Log.e(TAG, "handleDnsPacket error: ${e.message}")
+            Log.e(TAG, "parseDnsPacket error: ${e.message}")
             null
         }
     }
@@ -164,8 +202,9 @@ class DnsVpnService : VpnService() {
         ipHeaderLen: Int,
         dnsPayload: ByteArray
     ): ByteArray? {
+        var socket: DatagramSocket? = null
         return try {
-            val socket = DatagramSocket()
+            socket = DatagramSocket()
             // protect() tells Android to route this socket OUTSIDE the VPN tunnel,
             // so it uses the real network interface — no infinite loop.
             protect(socket)
@@ -178,13 +217,14 @@ class DnsVpnService : VpnService() {
             val responseBuffer = ByteArray(4096)
             val responsePacket = DatagramPacket(responseBuffer, responseBuffer.size)
             socket.receive(responsePacket)
-            socket.close()
 
             val dnsResponse = responseBuffer.copyOf(responsePacket.length)
             buildIpUdpResponse(originalPacket, ipHeaderLen, dnsResponse)
         } catch (e: Exception) {
             Log.e(TAG, "Upstream DNS forward failed: ${e.message}")
             null
+        } finally {
+            try { socket?.close() } catch (_: Exception) {}
         }
     }
 
@@ -199,6 +239,21 @@ class DnsVpnService : VpnService() {
         val dnsResponse = dnsQuery.copyOf()
         dnsResponse[2] = 0x81.toByte()  // QR=1, AA=1
         dnsResponse[3] = 0x83.toByte()  // RCODE=3 (NXDOMAIN)
+        return buildIpUdpResponse(originalPacket, ipHeaderLen, dnsResponse)
+    }
+
+    /**
+     * Builds a SERVFAIL DNS response — returned when upstream forwarding fails,
+     * so the client retries quickly instead of hanging until its own timeout.
+     */
+    private fun buildServfailResponse(
+        originalPacket: ByteArray,
+        ipHeaderLen: Int,
+        dnsQuery: ByteArray
+    ): ByteArray {
+        val dnsResponse = dnsQuery.copyOf()
+        dnsResponse[2] = 0x81.toByte()  // QR=1, AA=1
+        dnsResponse[3] = 0x82.toByte()  // RCODE=2 (SERVFAIL)
         return buildIpUdpResponse(originalPacket, ipHeaderLen, dnsResponse)
     }
 
