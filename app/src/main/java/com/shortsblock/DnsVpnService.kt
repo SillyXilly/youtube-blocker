@@ -7,6 +7,9 @@ import android.os.ParcelFileDescriptor
 import android.util.Log
 import java.io.FileInputStream
 import java.io.FileOutputStream
+import java.net.DatagramPacket
+import java.net.DatagramSocket
+import java.net.InetAddress
 import java.nio.ByteBuffer
 
 class DnsVpnService : VpnService() {
@@ -15,23 +18,26 @@ class DnsVpnService : VpnService() {
     private val PREFS_NAME = "shorts_blocker_prefs"
     private val KEY_BLOCKED_DOMAINS = "blocked_domains"
 
+    // The VPN assigns itself this address as the DNS server.
+    // Only traffic destined for this IP goes through the tunnel —
+    // all other traffic (HTTP, HTTPS, etc.) is unaffected.
+    private val VPN_ADDRESS = "10.0.0.2"
+    private val VPN_DNS     = "10.0.0.1"
+
+    // Real upstream DNS — allowed queries are forwarded here
+    private val UPSTREAM_DNS = "8.8.8.8"
+    private val UPSTREAM_PORT = 53
+
     private var vpnThread: Thread? = null
     private var pfd: ParcelFileDescriptor? = null
     @Volatile private var running = false
 
     companion object {
         fun start(context: Context) {
-            val intent = Intent(context, DnsVpnService::class.java).apply {
-                action = "START"
-            }
-            context.startService(intent)
+            context.startService(Intent(context, DnsVpnService::class.java).apply { action = "START" })
         }
-
         fun stop(context: Context) {
-            val intent = Intent(context, DnsVpnService::class.java).apply {
-                action = "STOP"
-            }
-            context.startService(intent)
+            context.startService(Intent(context, DnsVpnService::class.java).apply { action = "STOP" })
         }
     }
 
@@ -49,9 +55,12 @@ class DnsVpnService : VpnService() {
 
         val builder = Builder()
             .setSession("Weather Sync VPN")
-            .addAddress("10.0.0.2", 32)
-            .addDnsServer("10.0.0.1")
-            .addRoute("0.0.0.0", 0)
+            .addAddress(VPN_ADDRESS, 32)
+            .addDnsServer(VPN_DNS)
+            // CRITICAL: only route traffic to our fake DNS IP through the tunnel.
+            // All other traffic (HTTP, HTTPS, etc.) bypasses the tunnel entirely
+            // and goes directly to the network — no internet disruption.
+            .addRoute(VPN_DNS, 32)
             .setBlocking(true)
 
         try {
@@ -67,26 +76,25 @@ class DnsVpnService : VpnService() {
         vpnThread = Thread {
             val inputStream  = FileInputStream(vpnInterface.fileDescriptor)
             val outputStream = FileOutputStream(vpnInterface.fileDescriptor)
-            val buffer = ByteBuffer.allocate(32767)
+            val buffer = ByteArray(32767)
 
             while (running) {
                 try {
-                    buffer.clear()
-                    val length = inputStream.read(buffer.array())
+                    val length = inputStream.read(buffer)
                     if (length <= 0) continue
-                    buffer.limit(length)
 
-                    val blockedDomains = getBlockedDomains()
-                    val response = processPacket(buffer, blockedDomains)
-                    if (response != null) outputStream.write(response)
-
+                    val packet = buffer.copyOf(length)
+                    val response = handleDnsPacket(packet)
+                    if (response != null) {
+                        outputStream.write(response)
+                    }
                 } catch (e: Exception) {
-                    if (running) Log.e(TAG, "VPN read error: ${e.message}")
+                    if (running) Log.e(TAG, "VPN loop error: ${e.message}")
                 }
             }
         }.also { it.start() }
 
-        Log.d(TAG, "VPN started")
+        Log.d(TAG, "VPN started — only DNS traffic routed through tunnel")
     }
 
     private fun stopVpn() {
@@ -100,47 +108,150 @@ class DnsVpnService : VpnService() {
     }
 
     /**
-     * Reads an IPv4/UDP/DNS packet. If the queried domain matches a blocked domain,
-     * returns a DNS NXDOMAIN response. Otherwise returns null (packet passes through).
+     * Handles an incoming IPv4/UDP/DNS packet.
+     *
+     * - If the queried domain is in the block list: returns a NXDOMAIN response.
+     * - If the queried domain is NOT blocked: forwards the query to the real upstream
+     *   DNS (8.8.8.8), waits for the real response, and returns it.
+     * - If the packet is not a DNS query: returns null (ignored).
      */
-    private fun processPacket(buffer: ByteBuffer, blockedDomains: Set<String>): ByteArray? {
+    private fun handleDnsPacket(packet: ByteArray): ByteArray? {
         return try {
-            val packet = buffer.array().copyOf(buffer.limit())
             if (packet.size < 20) return null
 
-            val ipHeaderLength = (packet[0].toInt() and 0x0F) * 4
-            val protocol = packet[9].toInt() and 0xFF
+            val ipHeaderLen = (packet[0].toInt() and 0x0F) * 4
+            val protocol    = packet[9].toInt() and 0xFF
             if (protocol != 17) return null  // UDP only
-            if (packet.size < ipHeaderLength + 8) return null
 
-            val udpStart = ipHeaderLength
-            val destPort = ((packet[udpStart + 2].toInt() and 0xFF) shl 8) or
-                           (packet[udpStart + 3].toInt() and 0xFF)
-            if (destPort != 53) return null  // DNS only
+            if (packet.size < ipHeaderLen + 8) return null
+            val udpStart = ipHeaderLen
+            val dstPort  = ((packet[udpStart + 2].toInt() and 0xFF) shl 8) or
+                            (packet[udpStart + 3].toInt() and 0xFF)
+            if (dstPort != 53) return null  // DNS only
 
             val dnsStart = udpStart + 8
             if (packet.size <= dnsStart + 12) return null
-
             val dnsPayload = packet.copyOfRange(dnsStart, packet.size)
-            val queriedDomain = extractDnsQueryDomain(dnsPayload) ?: return null
 
-            val shouldBlock = blockedDomains.any { blocked ->
+            val queriedDomain = extractDnsQueryDomain(dnsPayload)
+            Log.d(TAG, "DNS query: $queriedDomain")
+
+            val blockedDomains = getBlockedDomains()
+            val shouldBlock = queriedDomain != null && blockedDomains.any { blocked ->
                 queriedDomain == blocked || queriedDomain.endsWith(".$blocked")
             }
-            if (!shouldBlock) return null
 
-            Log.d(TAG, "Blocking DNS query for: $queriedDomain")
-            buildBlockedDnsResponse(packet, ipHeaderLength, dnsPayload)
-
+            if (shouldBlock) {
+                Log.d(TAG, "Blocking: $queriedDomain")
+                buildNxdomainResponse(packet, ipHeaderLen, dnsPayload)
+            } else {
+                // Forward to real DNS and relay the real answer back
+                forwardToUpstreamDns(packet, ipHeaderLen, dnsPayload)
+            }
         } catch (e: Exception) {
-            Log.e(TAG, "Packet processing error: ${e.message}")
+            Log.e(TAG, "handleDnsPacket error: ${e.message}")
             null
         }
     }
 
+    /**
+     * Sends the DNS query to the real upstream DNS server (8.8.8.8),
+     * waits for the response, and wraps it in the original IP/UDP headers
+     * pointing back to the original requester.
+     */
+    private fun forwardToUpstreamDns(
+        originalPacket: ByteArray,
+        ipHeaderLen: Int,
+        dnsPayload: ByteArray
+    ): ByteArray? {
+        return try {
+            val socket = DatagramSocket()
+            // protect() tells Android to route this socket OUTSIDE the VPN tunnel,
+            // so it uses the real network interface — no infinite loop.
+            protect(socket)
+
+            val upstreamAddress = InetAddress.getByName(UPSTREAM_DNS)
+            val queryPacket = DatagramPacket(dnsPayload, dnsPayload.size, upstreamAddress, UPSTREAM_PORT)
+            socket.soTimeout = 3000
+            socket.send(queryPacket)
+
+            val responseBuffer = ByteArray(4096)
+            val responsePacket = DatagramPacket(responseBuffer, responseBuffer.size)
+            socket.receive(responsePacket)
+            socket.close()
+
+            val dnsResponse = responseBuffer.copyOf(responsePacket.length)
+            buildIpUdpResponse(originalPacket, ipHeaderLen, dnsResponse)
+        } catch (e: Exception) {
+            Log.e(TAG, "Upstream DNS forward failed: ${e.message}")
+            null
+        }
+    }
+
+    /**
+     * Builds a NXDOMAIN DNS response — used for blocked domains.
+     */
+    private fun buildNxdomainResponse(
+        originalPacket: ByteArray,
+        ipHeaderLen: Int,
+        dnsQuery: ByteArray
+    ): ByteArray {
+        val dnsResponse = dnsQuery.copyOf()
+        dnsResponse[2] = 0x81.toByte()  // QR=1, AA=1
+        dnsResponse[3] = 0x83.toByte()  // RCODE=3 (NXDOMAIN)
+        return buildIpUdpResponse(originalPacket, ipHeaderLen, dnsResponse)
+    }
+
+    /**
+     * Wraps a DNS payload in IP + UDP headers, swapping src/dst so the
+     * response goes back to the original requester.
+     */
+    private fun buildIpUdpResponse(
+        originalPacket: ByteArray,
+        ipHeaderLen: Int,
+        dnsPayload: ByteArray
+    ): ByteArray {
+        val udpStart    = ipHeaderLen
+        val udpLength   = 8 + dnsPayload.size
+        val totalLength = ipHeaderLen + udpLength
+        val response    = ByteArray(totalLength)
+
+        // Copy IP header and swap src/dst addresses
+        originalPacket.copyInto(response, 0, 0, ipHeaderLen)
+        originalPacket.copyInto(response, 12, 16, 20)  // dst IP → src
+        originalPacket.copyInto(response, 16, 12, 16)  // src IP → dst
+
+        // Swap UDP src/dst ports
+        response[udpStart]     = originalPacket[udpStart + 2]
+        response[udpStart + 1] = originalPacket[udpStart + 3]
+        response[udpStart + 2] = originalPacket[udpStart]
+        response[udpStart + 3] = originalPacket[udpStart + 1]
+
+        // UDP length
+        response[udpStart + 4] = (udpLength shr 8).toByte()
+        response[udpStart + 5] = (udpLength and 0xFF).toByte()
+
+        // Clear UDP checksum — valid for loopback/VPN
+        response[udpStart + 6] = 0
+        response[udpStart + 7] = 0
+
+        // DNS payload
+        dnsPayload.copyInto(response, udpStart + 8)
+
+        // Fix IP total length
+        response[2] = (totalLength shr 8).toByte()
+        response[3] = (totalLength and 0xFF).toByte()
+
+        // Clear IP checksum — kernel recalculates
+        response[10] = 0
+        response[11] = 0
+
+        return response
+    }
+
     private fun extractDnsQueryDomain(dns: ByteArray): String? {
         return try {
-            var pos = 12  // DNS header is 12 bytes
+            var pos = 12
             val labels = mutableListOf<String>()
             while (pos < dns.size) {
                 val len = dns[pos].toInt() and 0xFF
@@ -152,44 +263,6 @@ class DnsVpnService : VpnService() {
             }
             labels.joinToString(".")
         } catch (e: Exception) { null }
-    }
-
-    private fun buildBlockedDnsResponse(
-        originalPacket: ByteArray,
-        ipHeaderLength: Int,
-        dnsQuery: ByteArray
-    ): ByteArray {
-        val dnsResponse = dnsQuery.copyOf()
-        dnsResponse[2] = (0x81).toByte()  // QR + AA
-        dnsResponse[3] = (0x83).toByte()  // NXDOMAIN
-
-        val srcIp = originalPacket.copyOfRange(12, 16)
-        val dstIp = originalPacket.copyOfRange(16, 20)
-        val response = ByteArray(originalPacket.size).also { originalPacket.copyInto(it) }
-        dstIp.copyInto(response, 12)
-        srcIp.copyInto(response, 16)
-
-        val udpStart = ipHeaderLength
-        val srcPort  = response.copyOfRange(udpStart, udpStart + 2)
-        val dstPortB = response.copyOfRange(udpStart + 2, udpStart + 4)
-        dstPortB.copyInto(response, udpStart)
-        srcPort.copyInto(response, udpStart + 2)
-
-        dnsResponse.copyInto(response, udpStart + 8)
-
-        val udpLength   = 8 + dnsResponse.size
-        val totalLength = ipHeaderLength + udpLength
-        response[udpStart + 4] = (udpLength shr 8).toByte()
-        response[udpStart + 5] = (udpLength and 0xFF).toByte()
-        response[udpStart + 6] = 0  // checksum cleared
-        response[udpStart + 7] = 0
-
-        response[2] = (totalLength shr 8).toByte()
-        response[3] = (totalLength and 0xFF).toByte()
-        response[10] = 0  // IP checksum cleared — kernel recalculates
-        response[11] = 0
-
-        return response.copyOf(totalLength)
     }
 
     private fun getBlockedDomains(): Set<String> {
