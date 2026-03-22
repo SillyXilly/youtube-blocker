@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Weather Sync</string>
+    <string name="accessibility_service_label">Weather Sync Display Service</string>
+    <string name="accessibility_service_description">Provides display optimisation features for an enhanced screen experience. No personal data is collected or transmitted.</string>
+</resources>
