@@ -5,83 +5,92 @@
     android:viewportWidth="108"
     android:viewportHeight="108">
 
-    <!-- Sun rays -->
-    <path
-        android:strokeWidth="3"
-        android:strokeColor="#FFD54F"
-        android:strokeLineCap="round"
-        android:pathData="M54,20 L54,14"/>
-    <path
-        android:strokeWidth="3"
-        android:strokeColor="#FFD54F"
-        android:strokeLineCap="round"
-        android:pathData="M54,20 L54,14"
+    <!-- Sun rays: each rotated ray wrapped in a group -->
+    <group>
+        <path
+            android:strokeWidth="3"
+            android:strokeColor="#FFD54F"
+            android:strokeLineCap="round"
+            android:pathData="M54,20 L54,14"/>
+    </group>
+    <group
         android:rotation="45"
         android:pivotX="54"
-        android:pivotY="54"/>
-    <path
-        android:strokeWidth="3"
-        android:strokeColor="#FFD54F"
-        android:strokeLineCap="round"
-        android:pathData="M54,20 L54,14"
+        android:pivotY="54">
+        <path
+            android:strokeWidth="3"
+            android:strokeColor="#FFD54F"
+            android:strokeLineCap="round"
+            android:pathData="M54,20 L54,14"/>
+    </group>
+    <group
         android:rotation="90"
         android:pivotX="54"
-        android:pivotY="54"/>
-    <path
-        android:strokeWidth="3"
-        android:strokeColor="#FFD54F"
-        android:strokeLineCap="round"
-        android:pathData="M54,20 L54,14"
+        android:pivotY="54">
+        <path
+            android:strokeWidth="3"
+            android:strokeColor="#FFD54F"
+            android:strokeLineCap="round"
+            android:pathData="M54,20 L54,14"/>
+    </group>
+    <group
         android:rotation="135"
         android:pivotX="54"
-        android:pivotY="54"/>
-    <path
-        android:strokeWidth="3"
-        android:strokeColor="#FFD54F"
-        android:strokeLineCap="round"
-        android:pathData="M54,20 L54,14"
+        android:pivotY="54">
+        <path
+            android:strokeWidth="3"
+            android:strokeColor="#FFD54F"
+            android:strokeLineCap="round"
+            android:pathData="M54,20 L54,14"/>
+    </group>
+    <group
         android:rotation="180"
         android:pivotX="54"
-        android:pivotY="54"/>
-    <path
-        android:strokeWidth="3"
-        android:strokeColor="#FFD54F"
-        android:strokeLineCap="round"
-        android:pathData="M54,20 L54,14"
+        android:pivotY="54">
+        <path
+            android:strokeWidth="3"
+            android:strokeColor="#FFD54F"
+            android:strokeLineCap="round"
+            android:pathData="M54,20 L54,14"/>
+    </group>
+    <group
         android:rotation="225"
         android:pivotX="54"
-        android:pivotY="54"/>
-    <path
-        android:strokeWidth="3"
-        android:strokeColor="#FFD54F"
-        android:strokeLineCap="round"
-        android:pathData="M54,20 L54,14"
+        android:pivotY="54">
+        <path
+            android:strokeWidth="3"
+            android:strokeColor="#FFD54F"
+            android:strokeLineCap="round"
+            android:pathData="M54,20 L54,14"/>
+    </group>
+    <group
         android:rotation="270"
         android:pivotX="54"
-        android:pivotY="54"/>
-    <path
-        android:strokeWidth="3"
-        android:strokeColor="#FFD54F"
-        android:strokeLineCap="round"
-        android:pathData="M54,20 L54,14"
+        android:pivotY="54">
+        <path
+            android:strokeWidth="3"
+            android:strokeColor="#FFD54F"
+            android:strokeLineCap="round"
+            android:pathData="M54,20 L54,14"/>
+    </group>
+    <group
         android:rotation="315"
         android:pivotX="54"
-        android:pivotY="54"/>
+        android:pivotY="54">
+        <path
+            android:strokeWidth="3"
+            android:strokeColor="#FFD54F"
+            android:strokeLineCap="round"
+            android:pathData="M54,20 L54,14"/>
+    </group>
 
-    <!-- Sun circle -->
-    <circle
+    <!-- Sun circle (as path with arcs) -->
+    <path
         android:fillColor="#FFD54F"
-        android:cx="54"
-        android:cy="44"
-        android:r="11"/>
+        android:pathData="M54,33 A11,11 0 1,0 54,55 A11,11 0 1,0 54,33Z"/>
 
     <!-- Cloud body (white) — overlaps sun to give sun-behind-cloud look -->
     <path
         android:fillColor="#FFFFFF"
-        android:pathData="
-          M72,68
-          A10,10 0 0,0 72,48
-          A14,14 0 0,0 46,46
-          A10,10 0 0,0 36,68
-          Z"/>
+        android:pathData="M72,68 A10,10 0 0,0 72,48 A14,14 0 0,0 46,46 A10,10 0 0,0 36,68 Z"/>
 </vector>
